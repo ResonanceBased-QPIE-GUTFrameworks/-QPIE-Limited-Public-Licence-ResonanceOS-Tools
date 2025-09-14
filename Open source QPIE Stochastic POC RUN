@@ -1,0 +1,238 @@
+import os, json, math, shutil, time
+import numpy as np
+import pandas as pd
+
+# -----------------------------
+# Config (mirrors the 12,333-run style)
+# -----------------------------
+OUTDIR = "results_12333"
+os.makedirs(OUTDIR, exist_ok=True)
+
+M = 16               # latent dimension
+T = 80               # timesteps per run
+TARGET_INDEX = 2     # emphasis + drift on index 2 (0-based)
+DRIFT_START = 40     # inclusive
+DRIFT_END   = 60     # exclusive
+DRIFT_MAG   = 0.25   # drift magnitude during window
+
+RNG_SEED_BASE = 20250914
+NOISE_STD = 0.06     # stochastic noise level for updates
+
+# Observer modulation (three tiny levels; neutral names)
+OBSERVER_LEVELS = [0.003, 0.006, 0.009]
+
+# Angle base + randomized small offsets per run (neutral naming)
+ANGLE_BASE = math.pi / 33.0
+ANGLE_OFFSETS = [-0.2, -0.1, 0.0, +0.1, +0.2]
+
+# Per-index mild emphasis profile (index 2 slightly > 1.0, others = 1.0)
+def emphasis_vector(m, target_index=2, boost=1.06):
+    vec = np.ones(m, dtype=float)
+    if 0 <= target_index < m:
+        vec[target_index] = boost
+    return vec
+
+# -----------------------------
+# Core helpers
+# -----------------------------
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / (np.sum(e) + 1e-12)
+
+def normalize_prob(x):
+    x = np.maximum(x, 0.0)
+    s = np.sum(x)
+    if s <= 0:
+        # fallback to uniform
+        return np.ones_like(x) / x.size
+    return x / s
+
+def coherence_from_prob(p):
+    # Coherence proxy: 1 - normalized entropy
+    # H_norm = H(p)/log(M); coherence = 1 - H_norm
+    p = np.clip(p, 1e-12, 1.0)
+    H = -np.sum(p * np.log(p))
+    return 1.0 - H / np.log(p.size)
+
+def build_random_mapping(m, rng):
+    W = rng.normal(0.0, 1.0, size=(m, m)) / math.sqrt(m)
+    b = rng.normal(0.0, 0.2, size=(m,))
+    return W, b
+
+def observer_signal(prob, weight_vec, angle):
+    # Generic observer signal: correlation * sin(angle)
+    return float(np.dot(prob, weight_vec)) * math.sin(angle)
+
+def update_step(prob, W, b, angle, weight_vec, obs_level, rng):
+    """
+    One stochastic update:
+    - linear map + bias
+    - add small angle-based term + weighted projection
+    - multiplicative observer modulation (tiny)
+    - softmax + noise + renorm
+    """
+    z = W @ prob + b
+    z += 0.03 * math.sin(angle)            # small angle term
+    z += 0.02 * float(np.dot(prob, weight_vec))  # small projection term
+
+    mod = 1.0 + obs_level * observer_signal(prob, weight_vec, angle)
+    z = z * mod
+
+    z = softmax(z)
+
+    # additive Gaussian noise (then renormalize)
+    z = z + rng.normal(0.0, NOISE_STD / M, size=z.shape)
+    z = normalize_prob(z)
+    return z
+
+def run_single_trajectory(mode_name, rng_seed, angle_base, angle_offsets, obs_levels,
+                          m=M, t_steps=T, target_index=TARGET_INDEX,
+                          drift_start=DRIFT_START, drift_end=DRIFT_END, drift_mag=DRIFT_MAG,
+                          emphasis_boost=1.06):
+    """
+    Runs one trajectory for a given 'mode' (res/adv/ens), returns per-run summary metrics.
+    """
+
+    rng = np.random.default_rng(rng_seed)
+    # Initial probability vector (random, normalized)
+    prob = rng.random(m)
+    prob = normalize_prob(prob)
+
+    # Per-index emphasis (tiny boost at target index)
+    weight_vec = emphasis_vector(m, target_index=target_index, boost=emphasis_boost)
+
+    # Draw a random mapping for this run
+    W, b = build_random_mapping(m, rng)
+
+    # Draw per-run angle offset and observer level (cycle via RNG)
+    angle_offset = rng.choice(angle_offsets)
+    obs_level = rng.choice(obs_levels)
+
+    # Technique-specific tweaks (kept generic & scrubbed)
+    if mode_name == "mode_res":
+        # resonance-flavored: use base map
+        W_eff, b_eff = W, b
+    elif mode_name == "mode_adv":
+        # adversarial-flavored: subtly perturb in a "worst-ish" direction
+        W_eff = W - 0.05 * np.sign(W) * rng.uniform(0.8, 1.2, size=W.shape)
+        b_eff = b - 0.05 * np.sign(b) * rng.uniform(0.8, 1.2, size=b.shape)
+    elif mode_name == "mode_ens":
+        # ensemble-flavored: average multiple perturbed updates per step
+        W_eff, b_eff = W, b
+    else:
+        W_eff, b_eff = W, b
+
+    # Time series storage (optional; here we aggregate from tail)
+    tail_window = max(5, t_steps // 4)
+    tail_probs = []
+
+    for t in range(t_steps):
+        # Mid-run drift on target index (stress scenario)
+        if drift_start <= t < drift_end:
+            prob[target_index] = np.clip(prob[target_index] + drift_mag / t_steps, 0.0, 1.0)
+            prob = normalize_prob(prob)
+
+        angle_t = angle_base + angle_offset
+
+        if mode_name != "mode_ens":
+            # Single update
+            prob = update_step(prob, W_eff, b_eff, angle_t, weight_vec, obs_level, rng)
+        else:
+            # Ensemble of K members averaged
+            K = 5
+            acc = np.zeros_like(prob)
+            for k in range(K):
+                # slightly different tiny noise per member
+                acc += update_step(prob, W_eff, b_eff, angle_t, weight_vec, obs_level, rng)
+            prob = normalize_prob(acc / K)
+
+        if t >= (t_steps - tail_window):
+            tail_probs.append(prob.copy())
+
+    # Aggregate steady-state/tail metrics
+    tail_arr = np.stack(tail_probs, axis=0)  # shape (tail_window, m)
+    tail_mean = tail_arr.mean(axis=0)
+
+    # Metrics
+    coherence = float(np.mean([coherence_from_prob(p) for p in tail_arr]))
+    stability = float(np.std([coherence_from_prob(p) for p in tail_arr], ddof=1))
+    # Inverse volatility-like proxy (higher is better): mean_coh / (std+eps)
+    stability_index = float(coherence / (stability + 1e-12))
+    target_mean = float(tail_mean[target_index])
+    # "Task" proxy: distance-to-uniform over tail means
+    task_proxy = float(np.linalg.norm(tail_mean - np.ones(m)/m, ord=1))
+
+    return {
+        "mode": mode_name,
+        "rng_seed": rng_seed,
+        "angle_offset": angle_offset,
+        "obs_level": obs_level,
+        "coherence_tail_mean": coherence,
+        "coherence_tail_std": stability,
+        "stability_index": stability_index,
+        "target_index_tail_mean": target_mean,
+        "task_proxy_l1": task_proxy
+    }
+
+# -----------------------------
+# Batch runner (12,333 total)
+# -----------------------------
+def run_batch(total_runs=12333):
+    # Split evenly across 3 modes: 4111 each
+    per_mode = total_runs // 3
+    modes = ["mode_res", "mode_adv", "mode_ens"]
+    rows = {m: [] for m in modes}
+
+    # Cycle observer levels deterministically across runs within each mode
+    # and randomize angle offsets per-run
+    for mode_i, mode in enumerate(modes):
+        for r in range(per_mode):
+            seed = RNG_SEED_BASE + (mode_i * per_mode) + r
+            out = run_single_trajectory(
+                mode_name=mode,
+                rng_seed=seed,
+                angle_base=ANGLE_BASE,
+                angle_offsets=ANGLE_OFFSETS,
+                obs_levels=OBSERVER_LEVELS
+            )
+            rows[mode].append(out)
+
+    return rows
+
+# -----------------------------
+# Execute & Save
+# -----------------------------
+rows_by_mode = run_batch(total_runs=12333)
+
+# Save per-mode CSVs
+for mode, rows in rows_by_mode.items():
+    df = pd.DataFrame(rows)
+    path = os.path.join(OUTDIR, f"{mode}_summary.csv")
+    df.to_csv(path, index=False)
+
+# Save aggregate CSV
+agg_list = []
+for mode, rows in rows_by_mode.items():
+    df = pd.DataFrame(rows)
+    summary = {
+        "mode": mode,
+        "n_runs": len(df),
+        "coh_mean_of_means": float(df["coherence_tail_mean"].mean()),
+        "coh_std_of_means": float(df["coherence_tail_mean"].std(ddof=1)),
+        "stability_index_mean": float(df["stability_index"].mean()),
+        "task_proxy_mean": float(df["task_proxy_l1"].mean()),
+        "target_index_tail_mean_mean": float(df["target_index_tail_mean"].mean())
+    }
+    agg_list.append(summary)
+
+df_agg = pd.DataFrame(agg_list)
+df_agg_path = os.path.join(OUTDIR, "aggregate_summary.csv")
+df_agg.to_csv(df_agg_path, index=False)
+
+# Zip & download
+shutil.make_archive("results_12333_bundle", "zip", OUTDIR)
+
+print("✅ Finished 12,333 runs.")
+print("Per-mode CSVs in:", OUTDIR)
+print("Aggregate summary:", df_agg_path)
